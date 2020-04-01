@@ -202,9 +202,36 @@ is_visible(_Method, Metadata) ->
 swagger_paths([], Acc) ->
   Acc;
 swagger_paths([Trail | T], Acc) ->
-  Path = normalize_path(trails:path_match(Trail)),
-  Metadata = normalize_map_values(validate_metadata(trails:metadata(Trail))),
-  swagger_paths(T, maps:put(Path, Metadata, Acc)).
+    Metadata = validate_metadata(trails:metadata(Trail)),
+    Metadata11 = normalize_map_values(Metadata),
+    Path_list = cowboy_path_variants(trails:path_match(Trail), []),
+    NewAcc = lists:foldl(
+        fun (PathVar, VarAcc) ->
+            Metadata1 = validate_swagger_map(Metadata11, [{path_params, extract_path_params(PathVar)}]),
+            %%Metadata2 = normalize_map_values(Metadata1),
+            PathVar2 = normalize_path(PathVar),
+            maps:put(PathVar2, Metadata1, VarAcc)
+        end, Acc, Path_list),
+    swagger_paths(T, NewAcc).
+
+%% @private
+cowboy_path_variants(Path, undefined) -> cowboy_path_variants(Path, []);
+cowboy_path_variants(Path, Acc) ->
+    case re:run(Path, "\\[([^\\[|\\]]+)\\]", [{capture, first}]) of
+        nomatch -> [Path|Acc];
+        {match, [{Pos, Len}]} ->
+            P_start = binary:part(Path, 0, Pos),
+            P_middle = binary:part(Path, Pos+1, Len-2),
+            P_end = binary:part(Path, Pos + Len, size(Path) - Pos - Len),
+            Acc1 = cowboy_path_variants(<<P_start/binary, P_end/binary>>, Acc),
+            cowboy_path_variants(<<P_start/binary, P_middle/binary, P_end/binary>>, Acc1)
+    end.
+
+extract_path_params(Path) ->
+    case re:run(Path, "\\:(\\w+)", [global, {capture, [1], binary}]) of
+        {match, Path_params} -> lists:flatten(Path_params);
+        nomatch -> []
+    end.
 
 %% @private
 normalize_path(Path) ->
@@ -252,23 +279,52 @@ create_swagger_spec(GlobalSpec, SanitizeTrails) ->
 
 %% @private
 validate_swagger_map(Map) ->
-  F = fun(_K, V) ->
-        Params = validate_swagger_map_params(maps:get(parameters, V, [])),
-        Responses = validate_swagger_map_responses(maps:get(responses, V, #{})),
-        V#{parameters => Params, responses => Responses}
-      end,
-  maps:map(F, Map).
+    validate_swagger_map(Map, []).
 
 %% @private
-validate_swagger_map_params(Params) ->
-  ValidateParams =
-    fun(E) ->
-      case maps:get(name, E, undefined) of
-        undefined -> false;
-        _         -> {true, E#{in => maps:get(in, E, <<"path">>)}}
-      end
-    end,
-  lists:filtermap(ValidateParams, Params).
+validate_swagger_map(Map, Options) ->
+    F = fun(_K, V) ->
+        Params = validate_swagger_map_params(maps:get(parameters, V, []), Options),
+        Responses = validate_swagger_map_responses(maps:get(responses, V, #{})),
+        V#{parameters => Params, responses => Responses}
+        end,
+    maps:map(F, Map).
+
+%% @private
+validate_swagger_map_params(Params, Options) ->
+    ValidateParams =
+        fun(E) ->
+            case maps:get(name, E, undefined) of
+                undefined -> false;
+                _         -> case maps:get(in, E, <<"path">>) of
+                                 path -> {true, E#{required => true}};
+                                 <<"path">> -> {true, E#{in => path, required => true}};
+                                 _ -> {true, E}
+                             end
+            end
+        end,
+    Params1 = lists:filtermap(ValidateParams, Params),
+    case proplists:get_value(path_params, Options) of
+        undefined -> Params1;
+        Tp ->
+            {True_rest, RevParams} = lists:foldl(
+                fun (E = #{in := path, name := Name}, {True_plist, Acc_p}) ->
+                    case lists:member(Name, True_plist) of
+                        true -> {lists:delete(Name, True_plist), [E|Acc_p]};
+                        _    -> {True_plist, Acc_p}
+                    end;
+                    (E, {True_plist, Acc_p}) -> {True_plist, [E|Acc_p]}
+                end, {Tp, []}, Params1),
+            Params2 = lists:reverse(RevParams)
+                ++ [#{name => P_name, in => path, required => true, type => string} || P_name <- True_rest],
+            lists:sort(
+                fun (#{in := X}, #{in := X}) -> true;
+                    (#{in := _}, #{in := header}) -> false;
+                    (#{in := header}, #{in := path}) -> true;
+                    (#{in := _}, #{in := path}) -> false;
+                    (_, _) -> true
+                end, Params2)
+    end.
 
 %% @private
 validate_swagger_map_responses(Responses) ->
